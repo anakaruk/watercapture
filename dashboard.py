@@ -1,47 +1,48 @@
 import streamlit as st
 import pandas as pd
-from firestore_loader import load_data
-from ui_display import show_table, show_plot
-from data_play import process_data
+import altair as alt
+from firestore_loader import get_active_experiment, list_experiments, load_experiment_data
 
-# -----------------------------
-# Streamlit Page Config
-# -----------------------------
-st.set_page_config(page_title="Watercapture Dashboard", layout="wide")
+# --- Sidebar: Experiment selection ---
+st.sidebar.header("Experiment Control")
 
-st.title("💧 Watercapture Dashboard")
+active_exp = get_active_experiment()
 
-# -----------------------------
-# Sidebar Controls
-# -----------------------------
-station = st.sidebar.selectbox(
-    "Select Station",
-    ["station_TestUnit@HighBay", "station_AquaPars", "station_T50"]
-)
-limit = st.sidebar.slider("Rows to load", 100, 5000, 1000)
-
-# -----------------------------
-# Load Data from Firestore
-# -----------------------------
-df = load_data(station, limit=limit)
-
-if df is not None and not df.empty:
-    # Process data (calculations, derived fields)
-    df_proc = process_data(df)
-
-    st.subheader("Raw Data")
-    show_table(df_proc)
-
-    st.subheader("Trends")
-    show_plot(df_proc)
-
-    # Allow CSV export
-    csv = df_proc.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        label="⬇️ Download Data as CSV",
-        data=csv,
-        file_name=f"{station}_data.csv",
-        mime="text/csv",
-    )
+if active_exp:
+    st.sidebar.success(f"Running Experiment: {active_exp['id']}")
+    mode = "realtime"
 else:
-    st.warning("⚠️ No data loaded. Check Firestore connection or station name.")
+    st.sidebar.warning("No experiment running")
+    all_exps = list_experiments()
+    st.sidebar.write(f"Total experiments: **{len(all_exps)}**")
+    selected = st.sidebar.selectbox("Select experiment:", [e["id"] for e in all_exps])
+    mode = "historical"
+
+# --- Plotting ---
+if mode == "realtime":
+    st.subheader("Real-Time Weight vs Experimental Time")
+    data = load_experiment_data(active_exp["id"], realtime=True)  # fetch streaming updates
+    chart = alt.Chart(data).mark_line().encode(
+        x="experimental_time",
+        y="weight"
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+elif mode == "historical":
+    if selected:
+        st.subheader(f"Experiment {selected}")
+        data = load_experiment_data(selected)
+        chart = alt.Chart(data).mark_line().encode(
+            x="experimental_time",
+            y="weight"
+        )
+        st.altair_chart(chart, use_container_width=True)
+
+        # --- CSV Download ---
+        csv = data.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download CSV",
+            csv,
+            f"{selected}_data.csv",
+            "text/csv"
+        )
