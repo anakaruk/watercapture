@@ -17,7 +17,7 @@ st.sidebar.header("Experiment Control")
 
 # Historical mode (no live flag yet)
 try:
-    _ = get_active_experiment()  # kept for future; currently returns None
+    _ = get_active_experiment()  # currently returns None; kept for future live mode
 except FirestoreUnavailable as e:
     st.error(e.user_msg)
     st.stop()
@@ -49,29 +49,38 @@ def draw_chart(df: pd.DataFrame, title: str):
         st.info("No data to plot yet.")
         return
 
-    # Pick X
-    if "experimental_runtime" in df.columns:
-        df = df.copy()
-        # Convert to timedelta if not already
-        if pd.api.types.is_numeric_dtype(df["experimental_runtime"]):
-            df["runtime_hms"] = pd.to_timedelta(df["experimental_runtime"], unit="s")
-        else:
-            try:
-                df["runtime_hms"] = pd.to_timedelta(df["experimental_runtime"])
-            except Exception:
-                # Fall back to string/time axis
-                df["runtime_hms"] = pd.to_timedelta(pd.NaT)
+    df = df.copy()
 
-        # If conversion succeeded for at least some rows, use temporal axis
-        if df["runtime_hms"].notna().any():
-            x_enc = alt.X("runtime_hms:T", title="Experimental time (hh:mm:ss)")
-        else:
-            x_enc = alt.X("experimental_runtime:N", title="Experimental time")
-    else:
-        # Fall back to 'time' display string if present
+    # ---------- X axis selection ----------
+    x_enc = None
+    # Prefer experimental runtime if present
+    if "experimental_runtime" in df.columns:
+        td = pd.to_timedelta(df["experimental_runtime"], errors="coerce")
+        # numeric seconds for Vega-Lite quantitative axis
+        df["runtime_s"] = td.dt.total_seconds()
+
+        def _fmt_hms(v):
+            if pd.isna(v):
+                return None
+            v = int(v)
+            h, r = divmod(v, 3600)
+            m, s = divmod(r, 60)
+            return f"{h:02d}:{m:02d}:{s:02d}"
+
+        df["runtime_hms"] = df["runtime_s"].apply(_fmt_hms)
+        if df["runtime_s"].notna().any():
+            x_enc = alt.X("runtime_s:Q", title="Experimental time (s)")
+
+    # If no runtime, try real timestamp
+    if x_enc is None and "timestamp" in df.columns and df["timestamp"].notna().any():
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        x_enc = alt.X("timestamp:T", title="Timestamp")
+
+    # Last resort: fall back to the raw 'time' string
+    if x_enc is None:
         x_enc = alt.X("time:N", title="Time")
 
-    # Y: show weight if present
+    # ---------- Y axis ----------
     y_field = "weight:Q" if "weight" in df.columns else alt.value(0)
 
     chart = (
@@ -82,7 +91,7 @@ def draw_chart(df: pd.DataFrame, title: str):
             y=alt.Y(y_field, title="Weight"),
             tooltip=[
                 alt.Tooltip("weight:Q", title="weight", format=".3f", undefined="ignore"),
-                alt.Tooltip("experimental_runtime:T", title="exp time", undefined="ignore"),
+                alt.Tooltip("runtime_hms:N", title="exp time", undefined="ignore"),
                 alt.Tooltip("time:N", title="time", undefined="ignore"),
                 alt.Tooltip("date:N", title="date", undefined="ignore"),
                 alt.Tooltip("experimental_run_number:N", title="sequence", undefined="ignore"),
@@ -96,8 +105,7 @@ def draw_chart(df: pd.DataFrame, title: str):
 # ---- Load & render selected experiment ----
 st.subheader(f"Historical: Experiment {exp_id}")
 try:
-    # NOTE: loader no longer accepts 'realtime'; just call it plain
-    df = load_experiment_data(exp_id)
+    df = load_experiment_data(exp_id)  # loader no longer uses 'realtime'
 except FirestoreUnavailable as e:
     st.error(e.user_msg)
     st.stop()
@@ -111,7 +119,7 @@ if not df.empty:
 # ---- CSV download ----
 prefer_cols = [
     "weight", "date", "time",
-    "experimental_runtime",       # HH:MM:SS or seconds → converted upstream
+    "experimental_runtime",       # HH:MM:SS or seconds; loader leaves as-is
     "experimental_run_number",    # == experiment_sequence
     "station",
 ]
