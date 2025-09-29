@@ -1,9 +1,6 @@
 # firestore_loader.py
-# Project: watercapture
-# Searches (in this order):
-#   A) watercapture / <any station doc> / readings / <reading doc>
-#   B) watercapture@ASU / readings / readings / <reading doc>      (older variant)
-#   C) readings / <reading doc>                                     (top-level fallback)
+# One-station layout:
+#   watercapture@ASU / <any parent doc> / readings / <reading doc with experiment_sequence>
 
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
@@ -15,12 +12,8 @@ class FirestoreUnavailable(Exception):
 
 _db = None
 
-# --- Collection/doc names ---
-ROOT_COLLECTION_A = "watercapture"      # <-- your current root collection
-STATION_READINGS = "readings"           # subcollection under each station doc
-ROOT_COLLECTION_B = "watercapture@ASU"  # legacy root-as-collection or doc name
-SPECIAL_DOC_B = "readings"              # doc that holds another "readings" subcollection
-TOPLEVEL_READINGS = "readings"          # optional top-level fallback
+ROOT_COLLECTION = "watercapture@ASU"   # the only (station) collection
+READINGS_SUBCOLL = "readings"          # subcollection holding the readings
 
 def _init_db():
     """Init Firestore client from Streamlit Secrets (gcp_project + gcp_service_account)."""
@@ -59,99 +52,72 @@ def _safe_int(v) -> Optional[int]:
         return None
 
 def _parse_seq(exp_id: str) -> int:
+    # Accept "exp_3" or "3"
     try:
         return int(str(exp_id).split("_")[-1])
     except Exception:
         raise FirestoreUnavailable(f"Bad experiment id: {exp_id}")
 
 def _row_from_reading(d: Dict[str, Any], station_hint: Optional[str]) -> Dict[str, Any]:
-    out = {
+    """Normalize a reading into a consistent row."""
+    base = {
         "weight": d.get("weight"),
         "date": d.get("date"),
         "time": d.get("time"),
         "experimental_runtime": d.get("experiment_runtime"),
         "experimental_run_number": d.get("experiment_sequence"),
-        "station": d.get("station") or station_hint,
+        "station": d.get("station") or station_hint or "watercapture@ASU",
     }
+    # keep any extra fields
     for k, v in d.items():
-        if k not in out and k != "experiment_sequence":
-            out[k] = v
-    return out
+        if k not in base and k != "experiment_sequence":
+            base[k] = v
+    return base
 
 # ---------------- Public API ----------------
 
 def get_active_experiment() -> Optional[Dict[str, Any]]:
-    # No explicit "running" flag in your data yet.
-    return None
+    """
+    Optional heuristic: newest sequence is "active" if the newest reading is
+    within the last 10 minutes. If you don't want this, return None always.
+    """
+    exps = list_experiments()
+    if not exps:
+        return None
+    newest = max(exps, key=lambda e: e["sequence"])
+    return None  # keep dashboard in historical mode only for now
 
 def list_experiments(limit: int = 200) -> List[Dict[str, Any]]:
     """
-    Treat each unique experiment_sequence as an experiment.
-    Returns: [{id:'exp_<seq>', sequence:int, count:int, station:str|None}, ...]
+    The ONLY definition of an experiment is experiment_sequence.
+    Returns [{ id:'exp_<seq>', sequence:int, count:int }, ...]
     """
     import streamlit as st
 
     db = _init_db()
     seq_counts: Dict[int, int] = {}
-    seq_station: Dict[int, Optional[str]] = {}
+    scanned = 0
 
-    # A) watercapture / <station> / readings
-    count_a = 0
-    try:
-        for station_doc in db.collection(ROOT_COLLECTION_A).stream():
-            try:
-                for snap in station_doc.reference.collection(STATION_READINGS).stream():
-                    rec = snap.to_dict() or {}
-                    seq = _safe_int(rec.get("experiment_sequence"))
-                    if seq is None:
-                        continue
-                    count_a += 1
-                    seq_counts[seq] = seq_counts.get(seq, 0) + 1
-                    if seq not in seq_station:
-                        seq_station[seq] = rec.get("station") or station_doc.id
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    # B) legacy: watercapture@ASU / readings / readings
-    count_b = 0
-    try:
-        parent = db.collection(ROOT_COLLECTION_B).document(SPECIAL_DOC_B)
-        for snap in parent.collection(STATION_READINGS).stream():
-            rec = snap.to_dict() or {}
-            seq = _safe_int(rec.get("experiment_sequence"))
-            if seq is None:
-                continue
-            count_b += 1
-            seq_counts[seq] = seq_counts.get(seq, 0) + 1
-            if seq not in seq_station:
-                seq_station[seq] = rec.get("station") or ROOT_COLLECTION_B
-    except Exception:
-        pass
-
-    # C) top-level readings
-    count_c = 0
-    try:
-        for snap in db.collection(TOPLEVEL_READINGS).stream():
-            rec = snap.to_dict() or {}
-            seq = _safe_int(rec.get("experiment_sequence"))
-            if seq is None:
-                continue
-            count_c += 1
-            seq_counts[seq] = seq_counts.get(seq, 0) + 1
-            if seq not in seq_station:
-                seq_station[seq] = rec.get("station")
-    except Exception:
-        pass
+    # Scan: watercapture@ASU/<parent>/readings/*
+    for parent in db.collection(ROOT_COLLECTION).stream():
+        try:
+            for snap in parent.reference.collection(READINGS_SUBCOLL).stream():
+                scanned += 1
+                rec = snap.to_dict() or {}
+                seq = _safe_int(rec.get("experiment_sequence"))
+                if seq is None:
+                    continue
+                seq_counts[seq] = seq_counts.get(seq, 0) + 1
+        except Exception:
+            continue
 
     try:
-        st.sidebar.caption(f"scan A={count_a} B={count_b} C={count_c}")
+        st.sidebar.caption(f"scanned readings docs: {scanned}")
     except Exception:
         pass
 
     items = [
-        {"id": f"exp_{seq}", "sequence": seq, "count": seq_counts[seq], "station": seq_station.get(seq)}
+        {"id": f"exp_{seq}", "sequence": seq, "count": seq_counts[seq]}
         for seq in sorted(seq_counts.keys())
     ]
     if limit and len(items) > limit:
@@ -159,53 +125,40 @@ def list_experiments(limit: int = 200) -> List[Dict[str, Any]]:
     return items
 
 def load_experiment_data(exp_id: str, realtime: bool = False) -> pd.DataFrame:
-    """Load all readings for a given experiment_sequence across all three locations."""
+    """
+    Load every reading where experiment_sequence == selected sequence.
+    """
     db = _init_db()
     seq = _parse_seq(exp_id)
     rows: List[Dict[str, Any]] = []
 
-    # A) watercapture / <station> / readings
-    try:
-        for station_doc in db.collection(ROOT_COLLECTION_A).stream():
-            try:
-                q = (
-                    station_doc.reference
-                    .collection(STATION_READINGS)
-                    .where("experiment_sequence", "==", seq)
-                    .stream()
-                )
-                for snap in q:
-                    rows.append(_row_from_reading(snap.to_dict() or {}, station_hint=station_doc.id))
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    # B) legacy: watercapture@ASU / readings / readings
-    try:
-        parent = db.collection(ROOT_COLLECTION_B).document(SPECIAL_DOC_B)
-        for snap in parent.collection(STATION_READINGS).where("experiment_sequence", "==", seq).stream():
-            rows.append(_row_from_reading(snap.to_dict() or {}, station_hint=ROOT_COLLECTION_B))
-    except Exception:
-        pass
-
-    # C) top-level readings
-    try:
-        for snap in db.collection(TOPLEVEL_READINGS).where("experiment_sequence", "==", seq).stream():
-            d = snap.to_dict() or {}
-            rows.append(_row_from_reading(d, station_hint=d.get("station")))
-    except Exception:
-        pass
+    # Query all parents (only one station, but many parent docs are fine)
+    for parent in db.collection(ROOT_COLLECTION).stream():
+        try:
+            q = (
+                parent.reference
+                .collection(READINGS_SUBCOLL)
+                .where("experiment_sequence", "==", seq)
+                .stream()
+            )
+            for snap in q:
+                rows.append(_row_from_reading(snap.to_dict() or {}, station_hint=parent.id))
+        except Exception:
+            continue
 
     df = pd.DataFrame(rows)
 
+    # Make HH:MM:SS plottable if present
     if "experimental_runtime" in df.columns:
         try:
             df["experimental_runtime"] = pd.to_timedelta(df["experimental_runtime"])
         except Exception:
             pass
 
-    prefer = ["weight", "date", "time", "experimental_runtime", "experimental_run_number", "station"]
+    prefer = [
+        "weight", "date", "time",
+        "experimental_runtime", "experimental_run_number", "station",
+    ]
     if not df.empty:
         ordered = [c for c in prefer if c in df.columns] + [c for c in df.columns if c not in prefer]
         df = df[ordered]
