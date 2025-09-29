@@ -1,26 +1,17 @@
 # ui_display.py
-# UI helper functions for consistent layout/styling.
+# Simple shared UI fragments (if you want to keep using them later)
 
 import streamlit as st
 
-def show_header():
+def header():
     st.markdown(
-        """
-        <h2 style="color:#2E86C1;">Water Capture Experiment Dashboard</h2>
-        <p style="color:gray;">Real-time monitoring & historical experiment data</p>
-        """,
+        "<h3 style='color:#2E86C1;margin-bottom:0'>Water Capture Experiment Dashboard</h3>"
+        "<p style='color:gray;margin-top:4px'>Real-time monitoring & historical data</p>",
         unsafe_allow_html=True,
     )
 
-
-def show_footer():
+def footer():
     st.markdown(
-        """
-        <hr>
-        <p style="text-align:center; color:gray; font-size:12px;">
-        Water Capture Project © 2025 | ASU Research
-        </p>
-        """,
+        "<hr><p style='text-align:center;color:gray;font-size:12px'>© 2025 Watercapture</p>",
         unsafe_allow_html=True,
     )
-
