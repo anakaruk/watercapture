@@ -1,14 +1,15 @@
 # firestore_loader.py
 # Project: watercapture
-# Auto-detect Firestore layout and load by experiment_sequence.
+# Path used:
+#   watercapture / watercapture@ASU / readings / <reading_doc>
 #
-# Supports BOTH:
-#   (A) watercapture / watercapture@ASU / readings / *
-#   (B) watercapture@ASU / <any-doc> / readings / *
-#
-# You can force a layout via secrets:
-#   root_collection = "watercapture@ASU"  # or "watercapture"
-#   station_doc     = "watercapture@ASU"  # used only for layout (A)
+# Notes:
+# - Tolerates an "orphan" parent document (parent may not exist, but subcollection does).
+# - Experiments are separated ONLY by `experiment_sequence`.
+# - Provides: list_experiments(), load_experiment_data(), load_latest_experiment().
+# - Optional secrets overrides:
+#     root_collection = "watercapture"
+#     station_doc     = "watercapture@ASU"
 
 from __future__ import annotations
 
@@ -17,12 +18,17 @@ from typing import List, Dict, Any, Optional, Iterable, Tuple
 import pandas as pd
 import streamlit as st
 
-# ---------- Errors ----------
+# --------- Config (defaults match your screenshot) ----------
+DEFAULT_ROOT = "watercapture"
+DEFAULT_DOC  = "watercapture@ASU"
+SUBCOL       = "readings"
+
+# --------- Errors ----------
 @dataclass
 class FirestoreUnavailable(Exception):
     user_msg: str
 
-# ---------- Firestore client ----------
+# --------- Firestore client ----------
 @st.cache_resource(show_spinner=False)
 def _init_db():
     try:
@@ -51,76 +57,43 @@ def _init_db():
     except Exception as e:
         raise FirestoreUnavailable(f"Firestore init failed: {e}")
 
-# ---------- Layout detection ----------
+# --------- Path resolution (NO parent .exists check) ----------
 @st.cache_data(ttl=60, show_spinner=False)
 def _resolve_parent_path() -> Tuple[str, str]:
     """
-    Returns (root_collection, station_doc) and guarantees that
-    <root_collection>/<station_doc>/readings exists (non-empty or at least accessible).
-
-    Tries, in order:
-      A) root="watercapture", doc="watercapture@ASU"
-      B) root="watercapture@ASU", doc="<first doc that has readings>"
-    Can be forced via secrets: root_collection, station_doc.
+    Returns (root_collection, station_doc) that has a readable 'readings' subcollection.
+    Uses secrets overrides if present; otherwise defaults to watercapture/watercapture@ASU.
     """
     db = _init_db()
 
-    # 1) If user provided explicit path in secrets, try that first.
-    root_override = st.secrets.get("root_collection")
-    station_override = st.secrets.get("station_doc")
-    if root_override and station_override:
-        parent = db.collection(root_override).document(station_override)
-        if parent.get().exists:
-            return (root_override, station_override)
-        else:
-            st.sidebar.error(f"Override path not found: {root_override}/{station_override}")
+    root = st.secrets.get("root_collection", DEFAULT_ROOT)
+    doc  = st.secrets.get("station_doc", DEFAULT_DOC)
 
-    # 2) Try layout (A): watercapture / watercapture@ASU
-    rootA, docA = "watercapture", st.secrets.get("station_doc") or "watercapture@ASU"
-    parentA = db.collection(rootA).document(docA)
+    # Try the explicit/default path first (without checking parent exists)
     try:
-        snapA = parentA.get()
-        if snapA.exists:
-            # If readings subcollection is reachable, accept.
-            _ = parentA.collection("readings").limit(1).get()
-            st.sidebar.caption(f"Using path: {rootA}/{docA}/readings")
-            return (rootA, docA)
+        _ = db.collection(root).document(doc).collection(SUBCOL).limit(1).get()
+        st.sidebar.caption(f"Using path: {root}/{doc}/{SUBCOL}")
+        return (root, doc)
     except Exception:
-        pass  # fall through to (B)
+        pass  # try auto-discovery below
 
-    # 3) Try layout (B): watercapture@ASU / <any-doc>
-    rootB = "watercapture@ASU"
-    if root_override:
-        rootB = root_override  # allow forcing collection name only
-
+    # If the above failed, try discovering a doc under root that has 'readings'
     try:
-        col_ref = db.collection(rootB)
-        # choose first doc that has 'readings' subcollection (or the only doc)
-        candidates = list(col_ref.list_documents(page_size=100))
-        found = None
-        for doc_ref in candidates:
+        col = db.collection(root)
+        for dref in col.list_documents(page_size=200):
             try:
-                # Touch doc; must exist
-                if doc_ref.get().exists:
-                    # Make sure readings subcollection is reachable
-                    _ = doc_ref.collection("readings").limit(1).get()
-                    found = doc_ref.id
-                    break
+                _ = dref.collection(SUBCOL).limit(1).get()
+                st.sidebar.caption(f"Using path: {root}/{dref.id}/{SUBCOL}")
+                return (root, dref.id)
             except Exception:
                 continue
-        if found:
-            st.sidebar.caption(f"Using path: {rootB}/{found}/readings")
-            return (rootB, found)
-        else:
-            raise FirestoreUnavailable(
-                f"No usable doc with 'readings' under collection '{rootB}'."
-            )
-    except Exception as e:
         raise FirestoreUnavailable(
-            f"Path resolve error: could not find a valid parent. Details: {e}"
+            f"No document with '{SUBCOL}' subcollection found under '{root}'."
         )
+    except Exception as e:
+        raise FirestoreUnavailable(f"Path resolve error: {e}")
 
-# ---------- Helpers ----------
+# --------- Helpers ----------
 def _safe_int(v) -> Optional[int]:
     try:
         return int(v)
@@ -139,16 +112,15 @@ def _combine_date_time(date_val, time_val) -> Optional[pd.Timestamp]:
     try:
         if pd.notna(date_val) and pd.notna(time_val):
             return pd.to_datetime(f"{date_val} {time_val}", errors="coerce")
-        elif pd.notna(date_val):
+        if pd.notna(date_val):
             return pd.to_datetime(date_val, errors="coerce")
-        elif pd.notna(time_val):
+        if pd.notna(time_val):
             today = pd.Timestamp.today().normalize()
             t = pd.to_datetime(str(time_val), errors="coerce")
             if pd.isna(t):
                 return None
             return pd.Timestamp(
-                year=today.year, month=today.month, day=today.day,
-                hour=t.hour, minute=t.minute, second=t.second, microsecond=t.microsecond
+                today.year, today.month, today.day, t.hour, t.minute, t.second, t.microsecond
             )
     except Exception:
         return None
@@ -163,9 +135,11 @@ def _row_from_reading(d: Dict[str, Any], station_hint: Optional[str]) -> Dict[st
         "experimental_run_number": d.get("experiment_sequence"),
         "station": d.get("station") or station_hint,
     }
+    # keep all extra fields
     for k, v in d.items():
         if k not in out:
             out[k] = v
+    # build/coerce timestamp
     if "timestamp" not in out or out.get("timestamp") in (None, ""):
         out["timestamp"] = _combine_date_time(out.get("date"), out.get("time"))
     else:
@@ -181,12 +155,12 @@ def _order_columns(df: pd.DataFrame) -> pd.DataFrame:
         "station",
     ]
     exist = [c for c in prefer if c in df.columns]
-    rest = [c for c in df.columns if c not in exist]
+    rest  = [c for c in df.columns if c not in exist]
     return df[exist + rest]
 
-# ---------- Public API ----------
+# --------- Public API ----------
 def get_active_experiment() -> Optional[Dict[str, Any]]:
-    """Historical-only dataset (no live flag)."""
+    """Historical-only dataset; no live/run flag."""
     return None
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -197,14 +171,14 @@ def list_experiments(limit: int = 200) -> List[Dict[str, Any]]:
     seq_counts: Dict[int, int] = {}
     scanned = 0
     try:
-        for snap in db.collection(root).document(doc).collection("readings").stream():
+        for snap in db.collection(root).document(doc).collection(SUBCOL).stream():
             scanned += 1
             rec = snap.to_dict() or {}
             seq = _safe_int(rec.get("experiment_sequence"))
             if seq is None:
                 continue
             seq_counts[seq] = seq_counts.get(seq, 0) + 1
-        st.sidebar.caption(f"scanned readings: {scanned}  ({root}/{doc}/readings)")
+        st.sidebar.caption(f"scanned readings: {scanned}  ({root}/{doc}/{SUBCOL})")
     except Exception as e:
         st.sidebar.error(f"Failed to stream readings: {e}")
         raise FirestoreUnavailable(f"Failed to stream readings: {e}")
@@ -231,9 +205,8 @@ def load_experiment_data(
 
     rows: List[Dict[str, Any]] = []
     try:
-        q = db.collection(root).document(doc).collection("readings").where(
-            "experiment_sequence", "==", seq
-        )
+        q = db.collection(root).document(doc).collection(SUBCOL) \
+              .where("experiment_sequence", "==", seq)
         snaps = list(q.stream())
         cnt = 0
         for s in snaps:
@@ -282,5 +255,5 @@ def load_latest_experiment(
     exps = list_experiments()
     if not exps:
         return pd.DataFrame()
-    latest = exps[-1]["id"]  # sequences are sorted ascending
+    latest = exps[-1]["id"]  # sequences sorted ascending
     return load_experiment_data(latest, fields=fields, order=order, limit=limit)
