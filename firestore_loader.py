@@ -1,5 +1,6 @@
 # firestore_loader.py
-# Works with watercapture project and `readings` collection
+# Works with Firestore project "watercapture"
+# Reads from collection path: watercapture@ASU/readings
 
 from dataclasses import dataclass
 from typing import List, Dict, Any
@@ -40,14 +41,14 @@ def _init_db():
         raise FirestoreUnavailable(f"Firestore init failed: {e}")
 
 def get_active_experiment():
-    """Not used with current readings structure"""
+    """Not used with current structure"""
     return None
 
 def list_experiments(limit: int = 5) -> List[Dict[str, Any]]:
-    """List unique experiment sequences from readings collection"""
+    """List unique experiment sequences from readings subcollection"""
     db = _init_db()
     try:
-        docs = db.collection("readings").limit(200).stream()
+        docs = db.collection("watercapture@ASU").collection("readings").limit(200).stream()
         seen = {}
         for d in docs:
             rec = d.to_dict() or {}
@@ -64,7 +65,8 @@ def load_experiment_data(exp_id: str, realtime: bool = False) -> pd.DataFrame:
     db = _init_db()
     try:
         seq = int(exp_id.split("_")[1])
-        docs = db.collection("readings").where("experiment_sequence", "==", seq).stream()
+        docs = db.collection("watercapture@ASU").collection("readings") \
+                 .where("experiment_sequence", "==", seq).stream()
         rows = []
         for snap in docs:
             d = snap.to_dict() or {}
