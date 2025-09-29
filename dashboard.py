@@ -15,65 +15,125 @@ st.title("💧 Water Capture Experiment Dashboard")
 
 st.sidebar.header("Experiment Control")
 
-# ---- Detect live experiment (≤5 min since last point) ----
+# ---------- Live detector ----------
 try:
-    live_info = get_active_experiment(live_window_s=300)  # 5 minutes
+    live_info = get_active_experiment(live_window_s=300)  # "live" if last point ≤ 5 min
 except FirestoreUnavailable as e:
     st.error(e.user_msg)
     st.stop()
 
-# ---- Load experiment list (historical) ----
+# ---------- Load experiment list ----------
 try:
     exps = list_experiments(limit=500)
 except FirestoreUnavailable as e:
     st.error(e.user_msg)
     st.stop()
 
+# ========== STATUS HEADER ==========
+col1, col2 = st.columns([1, 2])
+
+with col1:
+    if live_info and live_info.get("live"):
+        st.success(f"🟢 Live now: Experiment #{live_info['sequence']}")
+    else:
+        st.warning("⚪ No live experiment running right now")
+
+with col2:
+    st.info(f"📦 Experiments in record: **{len(exps)}**")
+
+# ---------- Build a summary table (seq, points, first/last timestamps, duration) ----------
+@st.cache_data(ttl=30, show_spinner=False)
+def build_experiment_summary(items):
+    rows = []
+    for e in items:
+        eid = e["id"]
+        seq = e["sequence"]
+        count = e["count"]
+        df = load_experiment_data(eid, order="asc")  # adds/normalizes 'timestamp'
+        if "timestamp" in df.columns and not df["timestamp"].isna().all():
+            ts_min = pd.to_datetime(df["timestamp"], errors="coerce").min()
+            ts_max = pd.to_datetime(df["timestamp"], errors="coerce").max()
+        else:
+            # fallback to combined date+time as strings
+            ts_min = pd.NaT
+            ts_max = pd.NaT
+        dur = None
+        if pd.notna(ts_min) and pd.notna(ts_max):
+            dur_td = ts_max - ts_min
+            # pretty HH:MM:SS
+            seconds = int(dur_td.total_seconds())
+            h, r = divmod(seconds, 3600)
+            m, s = divmod(r, 60)
+            dur = f"{h:02d}:{m:02d}:{s:02d}"
+        rows.append(
+            {
+                "experiment_id": eid,
+                "sequence": seq,
+                "points": count,
+                "start_time": ts_min,
+                "end_time": ts_max,
+                "duration": dur,
+            }
+        )
+    df_sum = pd.DataFrame(rows).sort_values("sequence").reset_index(drop=True)
+    # Friendly formatting
+    if "start_time" in df_sum:
+        df_sum["start_time"] = pd.to_datetime(df_sum["start_time"], errors="coerce")
+    if "end_time" in df_sum:
+        df_sum["end_time"] = pd.to_datetime(df_sum["end_time"], errors="coerce")
+    return df_sum
+
+summary_df = build_experiment_summary(exps)
+
+st.subheader("Experiment records")
+if summary_df.empty:
+    st.info("No experiments found yet.")
+else:
+    # Show a compact table
+    show_cols = ["sequence", "points", "start_time", "end_time", "duration", "experiment_id"]
+    st.dataframe(summary_df[show_cols], use_container_width=True, hide_index=True)
+
 st.sidebar.write(f"Total experiments: **{len(exps)}**")
 
-# ---- Mode selection ----
+# ---------- Mode selection ----------
 mode_options = []
 if live_info and live_info.get("live"):
     mode_options.append(f"Live (Experiment #{live_info['sequence']})")
 mode_options.append("Historical")
-
 mode = st.sidebar.radio("Mode:", mode_options, index=0)
 
-# ---- Historical chooser ----
+# ---------- Historical chooser ----------
 exp_id_hist = None
 if exps:
     labels = [f"Experiment #{e['sequence']} ({e['count']} points)" for e in exps]
     ids    = [e["id"] for e in exps]
-    default_idx = len(labels) - 1
+    default_idx = len(labels) - 1  # newest
     chosen = st.sidebar.selectbox("Select an experiment:", labels, index=default_idx,
                                   disabled=(mode.startswith("Live")))
     exp_id_hist = ids[labels.index(chosen)]
 else:
-    st.info("No experiments found yet.")
     st.stop()
 
-# ---- Chart helper ----
+# ---------- Chart helper ----------
 def draw_chart(df: pd.DataFrame, title: str):
     if df.empty:
         st.info("No data to plot yet.")
         return
     df = df.copy()
 
-    # X axis selection (prefer runtime seconds)
+    # X axis (prefer runtime seconds)
     x_enc = None
     if "experimental_runtime" in df.columns:
         td = pd.to_timedelta(df["experimental_runtime"], errors="coerce")
         df["runtime_s"] = td.dt.total_seconds()
 
         def _fmt_hms(v):
-            if pd.isna(v):
-                return None
+            if pd.isna(v): return None
             v = int(v)
             h, r = divmod(v, 3600)
             m, s = divmod(r, 60)
             return f"{h:02d}:{m:02d}:{s:02d}"
         df["runtime_hms"] = df["runtime_s"].apply(_fmt_hms)
-
         if df["runtime_s"].notna().any():
             x_enc = alt.X("runtime_s:Q", title="Experimental time (s)")
 
@@ -89,7 +149,7 @@ def draw_chart(df: pd.DataFrame, title: str):
             df["row_index"] = range(len(df))
             x_enc = alt.X("row_index:Q", title="Index")
 
-    # Y axis (force numeric)
+    # Y axis numeric
     y_field_name = None
     if "weight" in df.columns:
         df["weight_num"] = pd.to_numeric(df["weight"], errors="coerce")
@@ -99,7 +159,7 @@ def draw_chart(df: pd.DataFrame, title: str):
         df["value"] = 0.0
         y_field_name = "value"
 
-    # Tooltips only for existing fields
+    # Tooltips from existing fields
     tooltips = []
     if "weight_num" in df.columns:
         tooltips.append(alt.Tooltip("weight_num:Q", title="weight", format=".3f"))
@@ -107,14 +167,11 @@ def draw_chart(df: pd.DataFrame, title: str):
         tooltips.append(alt.Tooltip("weight:N", title="weight"))
     if "runtime_hms" in df.columns:
         tooltips.append(alt.Tooltip("runtime_hms:N", title="exp time"))
-    if "time" in df.columns:
-        tooltips.append(alt.Tooltip("time:N", title="time"))
-    if "date" in df.columns:
-        tooltips.append(alt.Tooltip("date:N", title="date"))
-    if "experimental_run_number" in df.columns:
-        tooltips.append(alt.Tooltip("experimental_run_number:N", title="sequence"))
-    if "station" in df.columns:
-        tooltips.append(alt.Tooltip("station:N", title="station"))
+    for col in ["time", "date", "experimental_run_number", "station"]:
+        if col in df.columns:
+            ttype = "N"
+            ttl = col.replace("_", " ")
+            tooltips.append(alt.Tooltip(f"{col}:{ttype}", title=ttl))
 
     chart = (
         alt.Chart(df)
@@ -128,11 +185,10 @@ def draw_chart(df: pd.DataFrame, title: str):
     )
     st.altair_chart(chart, use_container_width=True)
 
-# ---- Render ----
+# ---------- Render ----------
 if mode.startswith("Live") and live_info:
     live_id = live_info["id"]
     st.subheader(f"Live: Experiment {live_id}")
-    # Small manual refresh (press R or click button)
     colA, colB = st.columns([1, 6])
     with colA:
         if st.button("Refresh"):
@@ -156,8 +212,8 @@ else:
     if not df.empty:
         st.dataframe(df.head(50), use_container_width=True)
 
-# ---- CSV download (both modes use current df variable) ----
-current_df = df_live if (mode.startswith("Live") and live_info) else df
+# ---------- CSV download (current view) ----------
+current_df = (df_live if (mode.startswith("Live") and live_info) else df)
 if current_df is not None and not current_df.empty:
     prefer_cols = [
         "weight", "date", "time",
