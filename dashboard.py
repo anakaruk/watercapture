@@ -56,7 +56,6 @@ def draw_chart(df: pd.DataFrame, title: str):
     # Prefer experimental runtime if present
     if "experimental_runtime" in df.columns:
         td = pd.to_timedelta(df["experimental_runtime"], errors="coerce")
-        # numeric seconds for Vega-Lite quantitative axis
         df["runtime_s"] = td.dt.total_seconds()
 
         def _fmt_hms(v):
@@ -71,32 +70,58 @@ def draw_chart(df: pd.DataFrame, title: str):
         if df["runtime_s"].notna().any():
             x_enc = alt.X("runtime_s:Q", title="Experimental time (s)")
 
-    # If no runtime, try real timestamp
-    if x_enc is None and "timestamp" in df.columns and df["timestamp"].notna().any():
+    # If no runtime, try a real timestamp from the loader
+    if x_enc is None and "timestamp" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-        x_enc = alt.X("timestamp:T", title="Timestamp")
+        if df["timestamp"].notna().any():
+            x_enc = alt.X("timestamp:T", title="Timestamp")
 
     # Last resort: fall back to the raw 'time' string
     if x_enc is None:
-        x_enc = alt.X("time:N", title="Time")
+        # Make sure we at least have something to plot on X; if no 'time', synthesize an index
+        if "time" in df.columns:
+            x_enc = alt.X("time:N", title="Time")
+        else:
+            df["row_index"] = range(len(df))
+            x_enc = alt.X("row_index:Q", title="Index")
 
-    # ---------- Y axis ----------
-    y_field = "weight:Q" if "weight" in df.columns else alt.value(0)
+    # ---------- Y axis (force a numeric field) ----------
+    y_field_name = None
+    if "weight" in df.columns:
+        # Coerce weight to numeric; non-numeric -> NaN (will be dropped)
+        df["weight_num"] = pd.to_numeric(df["weight"], errors="coerce")
+        if df["weight_num"].notna().any():
+            y_field_name = "weight_num"
+    if y_field_name is None:
+        # Safe fallback if no weight: make a constant or incremental series (constant shows as flat line)
+        df["value"] = 0.0
+        y_field_name = "value"
+
+    # ---------- Build tooltips dynamically (Altair v5 requires fields to exist) ----------
+    tooltips = []
+    if "weight_num" in df.columns:
+        tooltips.append(alt.Tooltip("weight_num:Q", title="weight", format=".3f"))
+    elif "weight" in df.columns:
+        tooltips.append(alt.Tooltip("weight:N", title="weight"))
+
+    if "runtime_hms" in df.columns:
+        tooltips.append(alt.Tooltip("runtime_hms:N", title="exp time"))
+    if "time" in df.columns:
+        tooltips.append(alt.Tooltip("time:N", title="time"))
+    if "date" in df.columns:
+        tooltips.append(alt.Tooltip("date:N", title="date"))
+    if "experimental_run_number" in df.columns:
+        tooltips.append(alt.Tooltip("experimental_run_number:N", title="sequence"))
+    if "station" in df.columns:
+        tooltips.append(alt.Tooltip("station:N", title="station"))
 
     chart = (
         alt.Chart(df)
         .mark_line(point=True)
         .encode(
             x=x_enc,
-            y=alt.Y(y_field, title="Weight"),
-            tooltip=[
-                alt.Tooltip("weight:Q", title="weight", format=".3f", undefined="ignore"),
-                alt.Tooltip("runtime_hms:N", title="exp time", undefined="ignore"),
-                alt.Tooltip("time:N", title="time", undefined="ignore"),
-                alt.Tooltip("date:N", title="date", undefined="ignore"),
-                alt.Tooltip("experimental_run_number:N", title="sequence", undefined="ignore"),
-                alt.Tooltip("station:N", title="station", undefined="ignore"),
-            ],
+            y=alt.Y(f"{y_field_name}:Q", title="Weight"),
+            tooltip=tooltips if tooltips else None,
         )
         .properties(title=title, height=420)
     )
