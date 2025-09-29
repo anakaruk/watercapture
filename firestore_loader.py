@@ -1,15 +1,8 @@
 # firestore_loader.py
-# Project: watercapture
-# Path used:
+# Path:
 #   watercapture / watercapture@ASU / readings / <reading_doc>
 #
-# Notes:
-# - Tolerates an "orphan" parent document (parent may not exist, but subcollection does).
-# - Experiments are separated ONLY by `experiment_sequence`.
-# - Provides: list_experiments(), load_experiment_data(), load_latest_experiment().
-# - Optional secrets overrides:
-#     root_collection = "watercapture"
-#     station_doc     = "watercapture@ASU"
+# Quiet (no sidebar noise) + live experiment detection.
 
 from __future__ import annotations
 
@@ -18,17 +11,38 @@ from typing import List, Dict, Any, Optional, Iterable, Tuple
 import pandas as pd
 import streamlit as st
 
-# --------- Config (defaults match your screenshot) ----------
 DEFAULT_ROOT = "watercapture"
 DEFAULT_DOC  = "watercapture@ASU"
 SUBCOL       = "readings"
 
-# --------- Errors ----------
+# Toggle sidebar debug via secrets if you want: debug_sidebar = true
+DEBUG_SIDEBAR = bool(st.secrets.get("debug_sidebar", False))
+
+def _sb_caption(msg: str):
+    if DEBUG_SIDEBAR:
+        try:
+            st.sidebar.caption(msg)
+        except Exception:
+            pass
+
+def _sb_info(msg: str):
+    if DEBUG_SIDEBAR:
+        try:
+            st.sidebar.info(msg)
+        except Exception:
+            pass
+
+def _sb_error(msg: str):
+    if DEBUG_SIDEBAR:
+        try:
+            st.sidebar.error(msg)
+        except Exception:
+            pass
+
 @dataclass
 class FirestoreUnavailable(Exception):
     user_msg: str
 
-# --------- Firestore client ----------
 @st.cache_resource(show_spinner=False)
 def _init_db():
     try:
@@ -47,43 +61,32 @@ def _init_db():
         if not project_id:
             raise FirestoreUnavailable("No project id found in Streamlit secrets.")
         db = firestore.Client(project=project_id, credentials=creds)
-        try:
-            st.sidebar.info(f"Connected to Firestore: {project_id}")
-        except Exception:
-            pass
+        _sb_info(f"Connected to Firestore: {project_id}")
         return db
     except KeyError:
         raise FirestoreUnavailable("Missing `gcp_service_account` in Streamlit secrets.")
     except Exception as e:
         raise FirestoreUnavailable(f"Firestore init failed: {e}")
 
-# --------- Path resolution (NO parent .exists check) ----------
 @st.cache_data(ttl=60, show_spinner=False)
 def _resolve_parent_path() -> Tuple[str, str]:
-    """
-    Returns (root_collection, station_doc) that has a readable 'readings' subcollection.
-    Uses secrets overrides if present; otherwise defaults to watercapture/watercapture@ASU.
-    """
     db = _init_db()
-
     root = st.secrets.get("root_collection", DEFAULT_ROOT)
     doc  = st.secrets.get("station_doc", DEFAULT_DOC)
 
-    # Try the explicit/default path first (without checking parent exists)
     try:
         _ = db.collection(root).document(doc).collection(SUBCOL).limit(1).get()
-        st.sidebar.caption(f"Using path: {root}/{doc}/{SUBCOL}")
+        _sb_caption(f"Using path: {root}/{doc}/{SUBCOL}")
         return (root, doc)
     except Exception:
-        pass  # try auto-discovery below
+        pass
 
-    # If the above failed, try discovering a doc under root that has 'readings'
     try:
         col = db.collection(root)
         for dref in col.list_documents(page_size=200):
             try:
                 _ = dref.collection(SUBCOL).limit(1).get()
-                st.sidebar.caption(f"Using path: {root}/{dref.id}/{SUBCOL}")
+                _sb_caption(f"Using path: {root}/{dref.id}/{SUBCOL}")
                 return (root, dref.id)
             except Exception:
                 continue
@@ -93,7 +96,6 @@ def _resolve_parent_path() -> Tuple[str, str]:
     except Exception as e:
         raise FirestoreUnavailable(f"Path resolve error: {e}")
 
-# --------- Helpers ----------
 def _safe_int(v) -> Optional[int]:
     try:
         return int(v)
@@ -119,9 +121,8 @@ def _combine_date_time(date_val, time_val) -> Optional[pd.Timestamp]:
             t = pd.to_datetime(str(time_val), errors="coerce")
             if pd.isna(t):
                 return None
-            return pd.Timestamp(
-                today.year, today.month, today.day, t.hour, t.minute, t.second, t.microsecond
-            )
+            return pd.Timestamp(today.year, today.month, today.day,
+                                t.hour, t.minute, t.second, t.microsecond)
     except Exception:
         return None
     return None
@@ -135,11 +136,9 @@ def _row_from_reading(d: Dict[str, Any], station_hint: Optional[str]) -> Dict[st
         "experimental_run_number": d.get("experiment_sequence"),
         "station": d.get("station") or station_hint,
     }
-    # keep all extra fields
     for k, v in d.items():
         if k not in out:
             out[k] = v
-    # build/coerce timestamp
     if "timestamp" not in out or out.get("timestamp") in (None, ""):
         out["timestamp"] = _combine_date_time(out.get("date"), out.get("time"))
     else:
@@ -158,10 +157,54 @@ def _order_columns(df: pd.DataFrame) -> pd.DataFrame:
     rest  = [c for c in df.columns if c not in exist]
     return df[exist + rest]
 
-# --------- Public API ----------
-def get_active_experiment() -> Optional[Dict[str, Any]]:
-    """Historical-only dataset; no live/run flag."""
-    return None
+def get_active_experiment(live_window_s: int = 300) -> Optional[Dict[str, Any]]:
+    """
+    Heuristic 'live' detector:
+    - Find latest experiment_sequence present.
+    - Load its rows, compute latest timestamp (from date+time or 'timestamp').
+    - If latest timestamp is within live_window_s seconds of now -> treat as live.
+    Returns: {'id': 'exp_<seq>', 'sequence': seq, 'live': True} or None.
+    """
+    db = _init_db()
+    root, doc = _resolve_parent_path()
+
+    # Gather sequences
+    seqs: List[int] = []
+    try:
+        for snap in db.collection(root).document(doc).collection(SUBCOL).stream():
+            seq = _safe_int((snap.to_dict() or {}).get("experiment_sequence"))
+            if seq is not None:
+                seqs.append(seq)
+    except Exception as e:
+        _sb_error(f"Failed to scan for live: {e}")
+        return None
+    if not seqs:
+        return None
+
+    latest_seq = max(seqs)
+
+    # Fetch rows for latest seq and compute latest timestamp
+    try:
+        q = db.collection(root).document(doc).collection(SUBCOL) \
+              .where("experiment_sequence", "==", latest_seq)
+        snaps = list(q.stream())
+        ts_vals: List[pd.Timestamp] = []
+        for s in snaps:
+            row = _row_from_reading(s.to_dict() or {}, station_hint=doc)
+            ts_vals.append(pd.to_datetime(row.get("timestamp"), errors="coerce"))
+        if not ts_vals:
+            return None
+        latest_ts = pd.Series(ts_vals).max()
+        if pd.isna(latest_ts):
+            return None
+        # Compare with now
+        now = pd.Timestamp.utcnow()
+        live = (now - latest_ts.tz_localize(None)).total_seconds() <= live_window_s
+        if live:
+            return {"id": f"exp_{latest_seq}", "sequence": latest_seq, "live": True}
+        return None
+    except Exception:
+        return None
 
 @st.cache_data(ttl=60, show_spinner=False)
 def list_experiments(limit: int = 200) -> List[Dict[str, Any]]:
@@ -178,9 +221,9 @@ def list_experiments(limit: int = 200) -> List[Dict[str, Any]]:
             if seq is None:
                 continue
             seq_counts[seq] = seq_counts.get(seq, 0) + 1
-        st.sidebar.caption(f"scanned readings: {scanned}  ({root}/{doc}/{SUBCOL})")
+        _sb_caption(f"scanned readings: {scanned}  ({root}/{doc}/{SUBCOL})")
     except Exception as e:
-        st.sidebar.error(f"Failed to stream readings: {e}")
+        _sb_error(f"Failed to stream readings: {e}")
         raise FirestoreUnavailable(f"Failed to stream readings: {e}")
 
     items = [
@@ -191,13 +234,15 @@ def list_experiments(limit: int = 200) -> List[Dict[str, Any]]:
         items = items[:limit]
     return items
 
-@st.cache_data(ttl=120, show_spinner=False)
+@st.cache_data(ttl=10, show_spinner=False)  # short TTL helps Live refresh
 def load_experiment_data(
     exp_id: str | int,
     *,
     fields: Optional[Iterable[str]] = None,
     order: str = "asc",
     limit: Optional[int] = None,
+    realtime: bool = False,   # tolerated for backwards compatibility
+    **_ignored,
 ) -> pd.DataFrame:
     db = _init_db()
     root, doc = _resolve_parent_path()
@@ -221,9 +266,9 @@ def load_experiment_data(
                 }
                 row = {k: v for k, v in row.items() if k in keep}
             rows.append(row)
-        st.sidebar.caption(f"loaded rows for seq {seq}: {cnt}")
+        _sb_caption(f"loaded rows for seq {seq}: {cnt}")
     except Exception as e:
-        st.sidebar.error(f"Query failed for seq {seq}: {e}")
+        _sb_error(f"Query failed for seq {seq}: {e}")
         raise FirestoreUnavailable(f"Query failed: {e}")
 
     df = pd.DataFrame(rows)
